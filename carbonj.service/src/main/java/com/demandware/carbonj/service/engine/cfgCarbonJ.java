@@ -48,6 +48,7 @@ import org.springframework.context.annotation.DependsOn;
 import org.springframework.context.annotation.Import;
 import org.springframework.core.env.Environment;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PostConstruct;
 import java.io.File;
@@ -118,6 +119,13 @@ public class cfgCarbonJ
 
     @Value( "${relay.rules:config/relay-rules.conf}" ) private String relayRulesFile = "config/relay-rules.conf";
 
+    // Relay rules can be pulled from file or server
+    @Value( "${relay.rulesSrc:server}" ) private String relayRulesSrc;
+
+    @Value( "${relay.configServerBaseUrl:http://localhost:8081}" ) private String configServerBaseUrl;
+
+    @Value( "${relay.metricPrefix:pod1}" ) private String relayMetricPrefix;
+
     @Value( "${audit.rules:config/audit-rules.conf}" ) private String auditRulesFile = "config/audit-rules.conf";
 
     @Value( "${consumerRules:config/consumer-rules.conf}" ) private String consumerRulesFile =
@@ -170,20 +178,33 @@ public class cfgCarbonJ
 
     @Autowired MetricRegistry metricRegistry;
 
-    @Bean( name = "dataPointSinkRelay" ) Relay relay( ScheduledExecutorService s )
+    @Bean
+    public RestTemplate restTemplate() {
+        return new RestTemplate();
+    }
+
+    @Bean
+    public ConfigServerUtil configServerUtil(ScheduledExecutorService s, RestTemplate restTemplate) {
+        ConfigServerUtil configServerUtil = new ConfigServerUtil(restTemplate, configServerBaseUrl, relayMetricPrefix,
+                metricRegistry);
+        s.scheduleWithFixedDelay(configServerUtil::register, 15, 30, TimeUnit.SECONDS);
+        return configServerUtil;
+    }
+
+    @Bean( name = "dataPointSinkRelay" ) Relay relay( ScheduledExecutorService s, ConfigServerUtil configServerUtil )
     {
         File rulesFile = locateConfigFile( serviceDir, relayRulesFile );
         Relay r = new Relay( metricRegistry, "relay", rulesFile, destQueue, destBatchSize, refreshIntervalInMillis,
-                        destConfigDir, maxWaitTimeInSecs );
+                        destConfigDir, maxWaitTimeInSecs, relayRulesSrc, configServerUtil);
         s.scheduleWithFixedDelay( r::reload, 15, 30, TimeUnit.SECONDS );
         return r;
     }
 
-    @Bean( name = "auditLogRelay" ) Relay auditLog( ScheduledExecutorService s )
+    @Bean( name = "auditLogRelay" ) Relay auditLog( ScheduledExecutorService s, ConfigServerUtil configServerUtil )
     {
         File rulesFile = locateConfigFile( serviceDir, auditRulesFile );
         Relay r = new Relay( metricRegistry, "audit", rulesFile, destQueue, destBatchSize, refreshIntervalInMillis,
-                        destConfigDir, maxWaitTimeInSecs );
+                        destConfigDir, maxWaitTimeInSecs, "file", configServerUtil);
         s.scheduleWithFixedDelay( r::reload, 15, 30, TimeUnit.SECONDS );
         return r;
     }
