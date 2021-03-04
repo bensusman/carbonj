@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory;
 import org.springframework.boot.web.server.WebServerFactoryCustomizer;
 import org.springframework.boot.web.servlet.ServletRegistrationBean;
@@ -52,6 +53,7 @@ import org.springframework.web.client.RestTemplate;
 
 import javax.annotation.PostConstruct;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.Date;
 import java.util.Optional;
@@ -120,11 +122,19 @@ public class cfgCarbonJ
     @Value( "${relay.rules:config/relay-rules.conf}" ) private String relayRulesFile = "config/relay-rules.conf";
 
     // Relay rules can be pulled from file or server
-    @Value( "${relay.rulesSrc:server}" ) private String relayRulesSrc;
+    @Value( "${relay.rules.configSrc:file}" ) private String relayRulesSrc;
 
-    @Value( "${relay.configServerBaseUrl:http://localhost:8081}" ) private String configServerBaseUrl;
+    @Value( "${configServer.enabled:false}" ) private boolean configServerEnabled;
 
-    @Value( "${relay.metricPrefix:pod1}" ) private String relayMetricPrefix;
+    @Value( "${configServer.baseUrl:http://localhost:8081}" ) private String configServerBaseUrl;
+
+    @Value( "${configServer.infrastructure}" ) private String configServerInfrastructure;
+
+    @Value( "${configServer.processName}" ) private String configServerProcessName;
+
+    @Value( "${configServer.processInstance}" ) private String configServerProcessInstance;
+
+    @Value( "${configServer.backupFilePath:work/config-server-bkup.txt" ) private String backupFilePath;
 
     @Value( "${audit.rules:config/audit-rules.conf}" ) private String auditRulesFile = "config/audit-rules.conf";
 
@@ -184,10 +194,18 @@ public class cfgCarbonJ
     }
 
     @Bean
-    public ConfigServerUtil configServerUtil(ScheduledExecutorService s, RestTemplate restTemplate) {
-        ConfigServerUtil configServerUtil = new ConfigServerUtil(restTemplate, configServerBaseUrl, relayMetricPrefix,
-                metricRegistry);
-        s.scheduleWithFixedDelay(configServerUtil::register, 15, 30, TimeUnit.SECONDS);
+    @ConditionalOnProperty( name = "configServer.enabled", havingValue = "true" )
+    public ConfigServerUtil configServerUtil(ScheduledExecutorService s, RestTemplate restTemplate) throws IOException {
+        ConfigServerUtil configServerUtil = new ConfigServerUtil(restTemplate, configServerBaseUrl, metricRegistry,
+                String.format("%s.%s.%s", configServerInfrastructure, configServerProcessInstance,
+                        configServerProcessName), backupFilePath);
+        s.scheduleWithFixedDelay(() -> {
+            try {
+                configServerUtil.register();
+            } catch (IOException e) {
+                log.error(e.getMessage(), e);
+            }
+        }, 15, 30, TimeUnit.SECONDS);
         return configServerUtil;
     }
 

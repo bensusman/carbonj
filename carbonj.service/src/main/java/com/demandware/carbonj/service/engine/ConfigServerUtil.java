@@ -1,125 +1,344 @@
 package com.demandware.carbonj.service.engine;
 
-import com.codahale.metrics.Meter;
+import com.codahale.metrics.Counter;
 import com.codahale.metrics.MetricRegistry;
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.client.RestTemplate;
 
-import java.util.Collections;
-import java.util.List;
-import java.util.Objects;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 public class ConfigServerUtil {
 
-    private static Logger log = LoggerFactory.getLogger( ConfigServerUtil.class );
+    private static final Logger log = LoggerFactory.getLogger(ConfigServerUtil.class);
 
-    private volatile List<RelayRule> relayRules;
-
-    // TODO-SRH: pull this from config server
-    private volatile List<RelayRule> auditRules = Collections.EMPTY_LIST;
+    private volatile Map<String, ProcessConfig> nameToConfig;
 
     private final RestTemplate restTemplate;
 
     private final String registrationUrl;
 
-    private final String metricPrefix;
+    private final Counter registrationSuccessCount;
 
-    private final MetricRegistry metricRegistry;
+    private final Counter registrationFailureCount;
 
-    private final Meter registrationSuccess;
+    private final String processUniqueId;
 
-    private final Meter registrationFailure;
+    private final String processHost;
 
-    public ConfigServerUtil(RestTemplate restTemplate, String configServerBaseUrl, String metricPrefix,
-                            MetricRegistry metricRegistry) {
+    private final Path backupFilePath;
+
+    private final ObjectMapper objectMapper;
+
+    public ConfigServerUtil(RestTemplate restTemplate, String configServerBaseUrl, MetricRegistry metricRegistry,
+                            String processUniqueId, String backupFilePath) throws IOException {
         this.restTemplate = restTemplate;
-        this.registrationUrl = String.format("%s/rest/v1/relays/register", configServerBaseUrl);
-        this.metricPrefix = metricPrefix;
-        this.metricRegistry = metricRegistry;
-        this.registrationFailure = metricRegistry.meter(MetricRegistry.name("configServer", "registration", "failed"));
-        this.registrationSuccess = metricRegistry.meter(MetricRegistry.name("configServer", "registration", "success"));
+        this.registrationUrl = String.format("%s/rest/v1/processes/register", configServerBaseUrl);
+        this.registrationFailureCount = metricRegistry.counter(MetricRegistry.name("configServer", "registration",
+                "failed"));
+        this.registrationSuccessCount = metricRegistry.counter(MetricRegistry.name("configServer", "registration",
+                "success"));
+        this.processUniqueId = processUniqueId;
+        String hostName;
+        try {
+            hostName = InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            log.error("Unable to determine host name.", e);
+            hostName = "unknown";
+        }
+        this.processHost = hostName;
+        this.nameToConfig = new ConcurrentHashMap<>();
+        this.backupFilePath = Paths.get(backupFilePath);
+        this.objectMapper = new ObjectMapper();
         log.info("Config server registry initialised. Registration URL {}", registrationUrl);
         register();
     }
 
-    public synchronized void register() {
+    public String[] getConfigLines(String name) {
+        if (nameToConfig.containsKey(name)) {
+            return (String[]) Arrays.stream(nameToConfig.get(name).getValue().split("\n"))
+                    .filter(l -> !l.isEmpty())
+                    .toArray();
+        } else {
+            throw new RuntimeException("Unable to find config for name: " + name);
+        }
+    }
+
+    public synchronized void register() throws IOException {
         try {
-            final ResponseEntity<Registration> res = restTemplate.postForEntity(registrationUrl, getRegistration(),
-                    Registration.class);
+            final ResponseEntity<Process> res = restTemplate.postForEntity(registrationUrl, getRegistrationRequest(),
+                    Process.class);
             if (res.getStatusCode().value() >= 200 && res.getStatusCode().value() < 300) {
-                Registration registration = res.getBody();
-                this.relayRules = Stream.concat(registration.getSpecificRelayRules().stream(),
-                        registration.getGenericRelayRules().stream()).collect(Collectors.toList());
-                registrationSuccess.mark();
-                log.info("Config server registration success. Registration: {}", registration);
+                Process process = res.getBody();
+                if (process != null && process.getProcessConfigs() != null && !process.getProcessConfigs().isEmpty()) {
+                    updateConfig(process);
+                    saveToBackupFile(process);
+                    registrationSuccessCount.inc();
+                    log.info("Registered successfully with config server at {}, received configs: {}", registrationUrl,
+                            process.getProcessConfigs().stream().map(ProcessConfig::getName).collect(Collectors.toList()));
+                } else {
+                    handleRegistrationFailure(String.format("Invalid response from registration server. Process: %s",
+                            process), null);
+                }
             } else {
                 log.error("Config server registration failed. URL: {}, Response status code: {}", registrationUrl,
                         res.getStatusCodeValue());
-                registrationFailure.mark();
+                registrationFailureCount.inc();
             }
         } catch (Exception e) {
-            log.error("Unexpected error during config server registration. URL: " + registrationUrl, e);
-            registrationFailure.mark();
+            handleRegistrationFailure("Unexpected error during config server registration. URL: " + registrationUrl, e);
         }
     }
 
-    public List<RelayRule> getRelayRules() {
-        return relayRules;
+    private void saveToBackupFile(Process process) throws IOException {
+        if (!Files.exists(backupFilePath)) {
+            Files.createFile(backupFilePath);
+        }
+        // Clear content
+        BufferedWriter writer = Files.newBufferedWriter(backupFilePath);
+        writer.write("");
+        writer.flush();
+        objectMapper.writeValue(backupFilePath.toFile(), process);
     }
 
-    public List<RelayRule> getAuditRules() {
-        return auditRules;
+    private void updateConfig(Process process) {
+        final List<ProcessConfig> idBasedConfigs = process.getProcessConfigs().stream()
+                .filter(pc -> pc.getName().startsWith("id-based"))
+                .collect(Collectors.toList());
+        final Map<String, ProcessConfig> nameToConfigTmp = process.getProcessConfigs().stream()
+                .filter(pc -> !pc.getName().startsWith("id-based"))
+                .collect(Collectors.toMap(ProcessConfig::getName, pc -> pc));
+        // Merge id based configs
+        idBasedConfigs.forEach(pc -> {
+            final String genericConfigName = pc.getName().replaceFirst("id-based-", "");
+            if (nameToConfigTmp.containsKey(genericConfigName)) {
+                ProcessConfig genericConfig = nameToConfigTmp.get(genericConfigName);
+                if (pc.getValue().endsWith("\n")) {
+                    genericConfig.setValue(pc.getValue() + genericConfig.getValue());
+                } else {
+                    genericConfig.setValue(pc.getValue() + "\n" + genericConfig.getValue());
+                }
+            } else {
+                log.warn("Config merge failed. Generic config not found for id based config {}", pc.getName());
+            }
+        });
+        this.nameToConfig.putAll(nameToConfigTmp);
     }
 
-    private Registration getRegistration() {
-        // TODO
-        // metric prefix
-        // host
-        // avgMetricVolume
-        // env
-        // infrastructure
-        return new Registration(metricPrefix, "sholavanall-ltm.internal.salesforce.com", 100, "prd", "1P");
+    private void handleRegistrationFailure(String errMessage, Exception e) throws IOException {
+        if (e != null) {
+            log.error(errMessage, e);
+        } else {
+            log.error(errMessage);
+        }
+        registrationFailureCount.inc();
+        // Try reading previously pulled configuration from backup file. If unable to read then fail process.
+        if (Files.exists(backupFilePath) && Files.isReadable(backupFilePath) && Files.size(backupFilePath) > 0) {
+            Process process = objectMapper.readValue(Files.readAllBytes(backupFilePath), Process.class);
+            log.warn("Updating config from backup file: {}", backupFilePath);
+            updateConfig(process);
+        } else {
+            throw new RuntimeException("Failed to read config from back up file: " + backupFilePath);
+        }
     }
 
-    public static class Registration {
+    private Process getRegistrationRequest() {
+        return new Process(processUniqueId, processHost);
+    }
 
-        private String metricPrefix;
+    private static class ProcessConfig {
+
+        private long id;
+
+        private String name;
+
+        private String processId;
+
+        private String value;
+
+        private int version;
+
+        private String message;
+
+        private String author;
+
+        @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "MM/dd/yyyy HH:mm:ss")
+        private Date lastModifiedDate;
+
+        public ProcessConfig() {
+        }
+
+        public ProcessConfig(long id, String name, String processId, String value, int version, String message,
+                             String author, Date lastModifiedDate) {
+            this.id = id;
+            this.name = name;
+            this.processId = processId;
+            this.value = value;
+            this.version = version;
+            this.message = message;
+            this.author = author;
+            this.lastModifiedDate = lastModifiedDate;
+        }
+
+        public long getId() {
+            return id;
+        }
+
+        public void setId(long id) {
+            this.id = id;
+        }
+
+        public String getName() {
+            return name;
+        }
+
+        public void setName(String name) {
+            this.name = name;
+        }
+
+        public String getProcessId() {
+            return processId;
+        }
+
+        public void setProcessId(String processId) {
+            this.processId = processId;
+        }
+
+        public String getValue() {
+            return value;
+        }
+
+        public void setValue(String value) {
+            this.value = value;
+        }
+
+        public int getVersion() {
+            return version;
+        }
+
+        public void setVersion(int version) {
+            this.version = version;
+        }
+
+        public String getMessage() {
+            return message;
+        }
+
+        public void setMessage(String message) {
+            this.message = message;
+        }
+
+        public String getAuthor() {
+            return author;
+        }
+
+        public void setAuthor(String author) {
+            this.author = author;
+        }
+
+        public Date getLastModifiedDate() {
+            return lastModifiedDate;
+        }
+
+        public void setLastModifiedDate(Date lastModifiedDate) {
+            this.lastModifiedDate = lastModifiedDate;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            ProcessConfig that = (ProcessConfig) o;
+            return id == that.id &&
+                    version == that.version &&
+                    Objects.equals(name, that.name) &&
+                    Objects.equals(processId, that.processId) &&
+                    Objects.equals(value, that.value) &&
+                    Objects.equals(message, that.message) &&
+                    Objects.equals(author, that.author) &&
+                    Objects.equals(lastModifiedDate, that.lastModifiedDate);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(id, name, processId, value, version, message, author, lastModifiedDate);
+        }
+
+        @Override
+        public String toString() {
+            return "ProcessConfig{" +
+                    "id=" + id +
+                    ", name='" + name + '\'' +
+                    ", processId='" + processId + '\'' +
+                    ", value='" + value + '\'' +
+                    ", version=" + version +
+                    ", message='" + message + '\'' +
+                    ", author='" + author + '\'' +
+                    ", lastModifiedDate=" + lastModifiedDate +
+                    '}';
+        }
+    }
+
+    private static class Process {
+
+        private long id;
+
+        private String uniqueId;
 
         private String host;
 
-        private long avgMetricVolume;
+        @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "MM/dd/yyyy HH:mm:ss")
+        private Date firstRegistrationDate;
 
-        private String env;
+        @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "MM/dd/yyyy HH:mm:ss")
+        private Date lastRegistrationDate;
 
-        private String infrastructure;
+        private List<ProcessConfig> processConfigs;
 
-        private List<RelayRule> specificRelayRules;
-
-        private List<RelayRule> genericRelayRules;
-
-        public Registration() {
+        public Process() {
         }
 
-        public Registration(String metricPrefix, String host, long avgMetricVolume, String env, String infrastructure) {
-            this.metricPrefix = metricPrefix;
+        public Process(long id, String uniqueId, String host, Date firstRegistrationDate, Date lastRegistrationDate,
+                       List<ProcessConfig> processConfigs) {
+            this.id = id;
+            this.uniqueId = uniqueId;
             this.host = host;
-            this.avgMetricVolume = avgMetricVolume;
-            this.env = env;
-            this.infrastructure = infrastructure;
-            this.specificRelayRules = Collections.EMPTY_LIST;
-            this.genericRelayRules = Collections.EMPTY_LIST;
+            this.firstRegistrationDate = firstRegistrationDate;
+            this.lastRegistrationDate = lastRegistrationDate;
+            this.processConfigs = processConfigs;
         }
 
-        public String getMetricPrefix() {
-            return metricPrefix;
+        public Process(String uniqueId, String host) {
+            this.uniqueId = uniqueId;
+            this.host = host;
         }
 
-        public void setMetricPrefix(String metricPrefix) {
-            this.metricPrefix = metricPrefix;
+        public long getId() {
+            return id;
+        }
+
+        public void setId(long id) {
+            this.id = id;
+        }
+
+        public String getUniqueId() {
+            return uniqueId;
+        }
+
+        public void setUniqueId(String uniqueId) {
+            this.uniqueId = uniqueId;
         }
 
         public String getHost() {
@@ -130,129 +349,57 @@ public class ConfigServerUtil {
             this.host = host;
         }
 
-        public long getAvgMetricVolume() {
-            return avgMetricVolume;
+        public Date getFirstRegistrationDate() {
+            return firstRegistrationDate;
         }
 
-        public void setAvgMetricVolume(long avgMetricVolume) {
-            this.avgMetricVolume = avgMetricVolume;
+        public void setFirstRegistrationDate(Date firstRegistrationDate) {
+            this.firstRegistrationDate = firstRegistrationDate;
         }
 
-        public String getEnv() {
-            return env;
+        public Date getLastRegistrationDate() {
+            return lastRegistrationDate;
         }
 
-        public void setEnv(String env) {
-            this.env = env;
+        public void setLastRegistrationDate(Date lastRegistrationDate) {
+            this.lastRegistrationDate = lastRegistrationDate;
         }
 
-        public String getInfrastructure() {
-            return infrastructure;
+        public List<ProcessConfig> getProcessConfigs() {
+            return processConfigs;
         }
 
-        public void setInfrastructure(String infrastructure) {
-            this.infrastructure = infrastructure;
-        }
-
-        public List<RelayRule> getSpecificRelayRules() {
-            return specificRelayRules;
-        }
-
-        public void setSpecificRelayRules(List<RelayRule> specificRelayRules) {
-            this.specificRelayRules = specificRelayRules;
-        }
-
-        public List<RelayRule> getGenericRelayRules() {
-            return genericRelayRules;
-        }
-
-        public void setGenericRelayRules(List<RelayRule> genericRelayRules) {
-            this.genericRelayRules = genericRelayRules;
+        public void setProcessConfigs(List<ProcessConfig> processConfigs) {
+            this.processConfigs = processConfigs;
         }
 
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
-            Registration that = (Registration) o;
-            return avgMetricVolume == that.avgMetricVolume &&
-                    Objects.equals(metricPrefix, that.metricPrefix) &&
-                    Objects.equals(host, that.host) &&
-                    Objects.equals(env, that.env) &&
-                    Objects.equals(infrastructure, that.infrastructure) &&
-                    Objects.equals(specificRelayRules, that.specificRelayRules) &&
-                    Objects.equals(genericRelayRules, that.genericRelayRules);
+            Process process = (Process) o;
+            return id == process.id &&
+                    Objects.equals(uniqueId, process.uniqueId) &&
+                    Objects.equals(host, process.host) &&
+                    Objects.equals(firstRegistrationDate, process.firstRegistrationDate) &&
+                    Objects.equals(lastRegistrationDate, process.lastRegistrationDate) &&
+                    Objects.equals(processConfigs, process.processConfigs);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(metricPrefix, host, avgMetricVolume, env, infrastructure, specificRelayRules,
-                    genericRelayRules);
+            return Objects.hash(id, uniqueId, host, firstRegistrationDate, lastRegistrationDate, processConfigs);
         }
 
         @Override
         public String toString() {
-            return "Registration{" +
-                    "metricPrefix='" + metricPrefix + '\'' +
+            return "Process{" +
+                    "id=" + id +
+                    ", uniqueId='" + uniqueId + '\'' +
                     ", host='" + host + '\'' +
-                    ", avgMetricVolume=" + avgMetricVolume +
-                    ", env='" + env + '\'' +
-                    ", infrastructure='" + infrastructure + '\'' +
-                    ", specificRelayRules=" + specificRelayRules +
-                    ", genericRelayRules=" + genericRelayRules +
-                    '}';
-        }
-    }
-
-    public static class RelayRule {
-
-        private String regex;
-
-        private String destination;
-
-        public RelayRule() {
-        }
-
-        public RelayRule(String regex, String destination) {
-            this.regex = regex;
-            this.destination = destination;
-        }
-
-        public String getRegex() {
-            return regex;
-        }
-
-        public void setRegex(String regex) {
-            this.regex = regex;
-        }
-
-        public String getDestination() {
-            return destination;
-        }
-
-        public void setDestination(String destination) {
-            this.destination = destination;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            RelayRule relayRule = (RelayRule) o;
-            return Objects.equals(regex, relayRule.regex) &&
-                    Objects.equals(destination, relayRule.destination);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(regex, destination);
-        }
-
-        @Override
-        public String toString() {
-            return "RelayRule{" +
-                    "regex='" + regex + '\'' +
-                    ", destination='" + destination + '\'' +
+                    ", firstRegistrationDate=" + firstRegistrationDate +
+                    ", lastRegistrationDate=" + lastRegistrationDate +
+                    ", processConfigs=" + processConfigs +
                     '}';
         }
     }
