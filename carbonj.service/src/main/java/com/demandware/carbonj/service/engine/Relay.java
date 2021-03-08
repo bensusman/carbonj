@@ -55,7 +55,7 @@ public class Relay
         this.maxWaitTimeInMillis = maxWaitTimeInMillis;
         log.info( String.format("[%s] Starting relay", type) );
         this.rulesSrc = Preconditions.checkNotNull(relayRulesSrc);
-        this.configServerUtil = Preconditions.checkNotNull(configServerUtil);
+        this.configServerUtil = configServerUtil;
         this.rulesFile = Preconditions.checkNotNull( rulesFile );
         this.queueSize = queueSize;
         this.batchSize = batchSize;

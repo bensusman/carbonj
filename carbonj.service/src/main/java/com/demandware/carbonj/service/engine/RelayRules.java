@@ -69,7 +69,7 @@ public class RelayRules
         this.type = type;
         this.confFile = Preconditions.checkNotNull( confFile );
         this.confSrc = Preconditions.checkNotNull(confSrc);
-        this.configServerUtil = Preconditions.checkNotNull(configServerUtil);
+        this.configServerUtil = configServerUtil;
         this.restTemplate = new RestTemplate();
         log.debug( String.format( "Creating relay rules with config file [%s]", confFile ) );
         load();
@@ -172,13 +172,9 @@ public class RelayRules
         }
 
         if (type.equals("relay")) {
-            this.configLines = configServerUtil.getRelayRules().stream()
-                    .map( r -> r.getRegex() + "=" + r.getDestination())
-                    .collect(Collectors.toList());
+            this.configLines = Arrays.asList(configServerUtil.getConfigLines("relay-rules"));
         } else if (type.equals("audit")) {
-            this.configLines = configServerUtil.getAuditRules().stream()
-                    .map( r -> r.getRegex() + "=" + r.getDestination())
-                    .collect(Collectors.toList());
+            this.configLines = Arrays.asList(configServerUtil.getConfigLines("audit-rules"));
         } else {
             log.error("Failed to load configuration. Unsupported relay type: {}", type);
         }

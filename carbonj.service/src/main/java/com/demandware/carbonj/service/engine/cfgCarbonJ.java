@@ -74,6 +74,8 @@ public class cfgCarbonJ
 
     @Autowired StringsCache stringsCache;
 
+    @Autowired MetricRegistry metricRegistry;
+
     @Value( "${server.port:56788}" ) private int jettyPort;
 
     @Value( "${jetty.logfilepath:log/request-yyyy_mm_dd.log}" ) private String jettyLogfilePath;
@@ -116,6 +118,8 @@ public class cfgCarbonJ
 
     @Value( "${blacklist:config/blacklist.conf}" ) private String blacklistConfigFile = "config/blacklist.conf";
 
+    @Value( "${blacklistConfigSrc:file" ) private String blacklistConfigSrc;
+
     @Value( "${blacklist:config/query-blacklist.conf}" ) private String queryBlacklistConfigFile =
                     "config/query-blacklist.conf";
 
@@ -124,19 +128,9 @@ public class cfgCarbonJ
     // Relay rules can be pulled from file or server
     @Value( "${relay.rules.configSrc:file}" ) private String relayRulesSrc;
 
-    @Value( "${configServer.enabled:false}" ) private boolean configServerEnabled;
-
-    @Value( "${configServer.baseUrl:http://localhost:8081}" ) private String configServerBaseUrl;
-
-    @Value( "${configServer.infrastructure}" ) private String configServerInfrastructure;
-
-    @Value( "${configServer.processName}" ) private String configServerProcessName;
-
-    @Value( "${configServer.processInstance}" ) private String configServerProcessInstance;
-
-    @Value( "${configServer.backupFilePath:work/config-server-bkup.txt" ) private String backupFilePath;
-
     @Value( "${audit.rules:config/audit-rules.conf}" ) private String auditRulesFile = "config/audit-rules.conf";
+
+    @Value( "${audit.rules.configSrc:file}" ) private String auditRulesSrc;
 
     @Value( "${consumerRules:config/consumer-rules.conf}" ) private String consumerRulesFile =
                     "config/consumer-rules.conf";
@@ -186,7 +180,20 @@ public class cfgCarbonJ
 
     @Value( "${app.servicedir:}" ) private String serviceDir;
 
-    @Autowired MetricRegistry metricRegistry;
+    /**
+     * Config server properties
+     */
+    @Value( "${configServer.enabled:false}" ) private boolean configServerEnabled;
+
+    @Value( "${configServer.baseUrl:http://localhost:8081}" ) private String configServerBaseUrl;
+
+    @Value( "${configServer.infrastructure:unknownInfra}" ) private String configServerInfrastructure;
+
+    @Value( "${configServer.processName:unknownProcessName}" ) private String configServerProcessName;
+
+    @Value( "${configServer.processInstance:unknownProcessInstance}" ) private String configServerProcessInstance;
+
+    @Value( "${configServer.backupFilePath:work/config-server-bkup.txt" ) private String backupFilePath;
 
     @Bean
     public RestTemplate restTemplate() {
@@ -209,7 +216,8 @@ public class cfgCarbonJ
         return configServerUtil;
     }
 
-    @Bean( name = "dataPointSinkRelay" ) Relay relay( ScheduledExecutorService s, ConfigServerUtil configServerUtil )
+    @Bean( name = "dataPointSinkRelay" ) Relay relay( ScheduledExecutorService s,
+                                                      @Autowired(required = false) ConfigServerUtil configServerUtil )
     {
         File rulesFile = locateConfigFile( serviceDir, relayRulesFile );
         Relay r = new Relay( metricRegistry, "relay", rulesFile, destQueue, destBatchSize, refreshIntervalInMillis,
@@ -218,11 +226,12 @@ public class cfgCarbonJ
         return r;
     }
 
-    @Bean( name = "auditLogRelay" ) Relay auditLog( ScheduledExecutorService s, ConfigServerUtil configServerUtil )
+    @Bean( name = "auditLogRelay" ) Relay auditLog( ScheduledExecutorService s,
+                                                    @Autowired(required = false) ConfigServerUtil configServerUtil )
     {
         File rulesFile = locateConfigFile( serviceDir, auditRulesFile );
         Relay r = new Relay( metricRegistry, "audit", rulesFile, destQueue, destBatchSize, refreshIntervalInMillis,
-                        destConfigDir, maxWaitTimeInSecs, "file", configServerUtil);
+                        destConfigDir, maxWaitTimeInSecs, auditRulesSrc, configServerUtil);
         s.scheduleWithFixedDelay( r::reload, 15, 30, TimeUnit.SECONDS );
         return r;
     }
@@ -239,18 +248,20 @@ public class cfgCarbonJ
                         new Quota( errLogQuotaMax, errLogQuotaResetAfter ) );
     }
 
-    @Bean( name = "pointBlacklist" ) Blacklist pointBlacklist( ScheduledExecutorService s )
+    @Bean( name = "pointBlacklist" ) Blacklist pointBlacklist( ScheduledExecutorService s,
+                                                               @Autowired(required = false) ConfigServerUtil configServerUtil )
     {
         Blacklist bs = new Blacklist( metricRegistry, "blacklist",
-                        locateConfigFile( serviceDir, blacklistConfigFile ) );
+                        locateConfigFile( serviceDir, blacklistConfigFile ), blacklistConfigSrc, configServerUtil );
         s.scheduleWithFixedDelay( bs::reload, 10, 30, TimeUnit.SECONDS );
         return bs;
     }
 
-    @Bean( name = "queryBlacklist" ) Blacklist queryBlacklist( ScheduledExecutorService s )
+    @Bean( name = "queryBlacklist" ) Blacklist queryBlacklist( ScheduledExecutorService s,
+                                                               @Autowired(required = false) ConfigServerUtil configServerUtil )
     {
         Blacklist bs = new Blacklist( metricRegistry, "queryBlacklist",
-                        locateConfigFile( serviceDir, queryBlacklistConfigFile ) );
+                        locateConfigFile( serviceDir, queryBlacklistConfigFile ), blacklistConfigSrc, configServerUtil );
         s.scheduleWithFixedDelay( bs::reload, 10, 30, TimeUnit.SECONDS );
         return bs;
     }
