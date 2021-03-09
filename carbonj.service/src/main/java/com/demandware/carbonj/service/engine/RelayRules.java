@@ -172,9 +172,9 @@ public class RelayRules
         }
 
         if (type.equals("relay")) {
-            this.configLines = Arrays.asList(configServerUtil.getConfigLines("relay-rules"));
+            this.configLines = configServerUtil.getConfigLines("relay-rules");
         } else if (type.equals("audit")) {
-            this.configLines = Arrays.asList(configServerUtil.getConfigLines("audit-rules"));
+            this.configLines = configServerUtil.getConfigLines("audit-rules");
         } else {
             log.error("Failed to load configuration. Unsupported relay type: {}", type);
         }

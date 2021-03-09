@@ -104,7 +104,7 @@ public class Blacklist implements StatsAware
                     log.warn("Config server undefined. Unable to read black list configuration.");
                     return;
                 }
-                lines = Arrays.asList(configServerUtil.getConfigLines("blacklist"));
+                lines = configServerUtil.getConfigLines("blacklist");
             } else {
                 throw new RuntimeException("Unknown black list config src: " + confSrc);
             }

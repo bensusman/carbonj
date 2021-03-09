@@ -9,6 +9,7 @@ package com.demandware.carbonj.service.engine;
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.MetricRegistry;
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -54,8 +55,10 @@ public class ConfigServerUtil {
         this.registrationUrl = String.format("%s/rest/v1/processes/register", configServerBaseUrl);
         this.registrationFailureCount = metricRegistry.counter(MetricRegistry.name("configServer", "registration",
                 "failed"));
+        this.registrationFailureCount.inc(0);
         this.registrationSuccessCount = metricRegistry.counter(MetricRegistry.name("configServer", "registration",
                 "success"));
+        this.registrationSuccessCount.inc(0);
         this.processUniqueId = processUniqueId;
         String hostName;
         try {
@@ -68,15 +71,17 @@ public class ConfigServerUtil {
         this.nameToConfig = new ConcurrentHashMap<>();
         this.backupFilePath = Paths.get(backupFilePath);
         this.objectMapper = new ObjectMapper();
+        // For backward compatibility
+        this.objectMapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
         log.info("Config server registry initialised. Registration URL {}", registrationUrl);
         register();
     }
 
-    public String[] getConfigLines(String name) {
+    public List<String> getConfigLines(String name) {
         if (nameToConfig.containsKey(name)) {
-            return (String[]) Arrays.stream(nameToConfig.get(name).getValue().split("\n"))
+            return Arrays.stream(nameToConfig.get(name).getValue().split("\n"))
                     .filter(l -> !l.isEmpty())
-                    .toArray();
+                    .collect(Collectors.toList());
         } else {
             throw new RuntimeException("Unable to find config for name: " + name);
         }
@@ -99,9 +104,8 @@ public class ConfigServerUtil {
                             process), null);
                 }
             } else {
-                log.error("Config server registration failed. URL: {}, Response status code: {}", registrationUrl,
-                        res.getStatusCodeValue());
-                registrationFailureCount.inc();
+                handleRegistrationFailure(String.format("Config server registration failed. URL: %s, Response status " +
+                        "code: %s", registrationUrl, res.getStatusCodeValue()), null);
             }
         } catch (Exception e) {
             handleRegistrationFailure("Unexpected error during config server registration. URL: " + registrationUrl, e);
@@ -164,7 +168,7 @@ public class ConfigServerUtil {
         return new Process(processUniqueId, processHost);
     }
 
-    private static class ProcessConfig {
+    static class ProcessConfig {
 
         private long id;
 
@@ -297,7 +301,7 @@ public class ConfigServerUtil {
         }
     }
 
-    private static class Process {
+    static class Process {
 
         private long id;
 
